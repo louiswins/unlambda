@@ -147,7 +147,7 @@ void cont_decref(cont *c) {
 			fun_decref(c->v.f);
 			break;
 		default:
-			fprintf(stderr, "Memory corruption at %s\n", __LINE__);
+			fprintf(stderr, "Memory corruption at %d\n", __LINE__);
 			return;
 		}
 		cont_decref(c->next);
@@ -363,7 +363,7 @@ void toss(cont *c, fun *val) {
 		end_the_program(val);
 		return;
 	default:
-		fprintf(stderr, "Memory corruption at %s\n", __LINE__);
+		fprintf(stderr, "Memory corruption at %d\n", __LINE__);
 		return;
 	}
 }
