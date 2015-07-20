@@ -30,12 +30,13 @@ typedef struct cont cont;
 /* A "function": i or .x or `sk or something like that. */
 struct fun {
 	int refcount;
-	enum { KAY, KAY1, ESS, ESS1, ESS2, EYE, VEE, DEE, DEE1, DOT } type;
+	enum { KAY, KAY1, ESS, ESS1, ESS2, EYE, VEE, DEE, DEE1, DOT, SEE, CONT } type;
 	union {
 		fun *onefunc; /* for KAY1 and ESS1: `k(onefunc) or `s(onefunc) */
 		struct { fun *f1, *f2; } twofunc; /* for ESS2: ``s(f1)(f2) */
 		expr *expr; /* for DEE1: `d(expr) */
 		char toprint; /* for DOT: .(toprint) */
+		cont *cont;
 	} v;
 };
 
@@ -71,7 +72,7 @@ void expr_decref(expr *e);
 cont *cont_addref(cont *c);
 void cont_decref(cont *c);
 
-#define IS_STATIC_FUN_TYPE(type) ((type) == KAY || (type) == ESS || (type) == EYE || (type) == VEE || (type) == DEE)
+#define IS_STATIC_FUN_TYPE(type) ((type) == KAY || (type) == ESS || (type) == EYE || (type) == VEE || (type) == DEE || (type) == SEE)
 fun *fun_addref(fun *f) {
 	if (!IS_STATIC_FUN_TYPE(f->type))
 		f->refcount++;
@@ -95,6 +96,9 @@ void fun_decref(fun *f) {
 			expr_decref(f->v.expr);
 			break;
 		case DOT:
+			break;
+		case CONT:
+			cont_decref(f->v.cont);
 			break;
 		default:
 			fprintf(stderr, "Memory corruption at %d\n", __LINE__);
@@ -161,6 +165,7 @@ fun k_fun = { 1, KAY };
 fun i_fun = { 1, EYE };
 fun v_fun = { 1, VEE };
 fun d_fun = { 1, DEE };
+fun c_fun = { 1, SEE };
 
 cont term_c = { 1, TERM };
 
@@ -245,9 +250,14 @@ expr* parse() {
 		ret->type = FUNCTION;
 		ret->v.func = &d_fun;
 		return ret;
+	case 'c':
+	case 'C':
+		ret->type = FUNCTION;
+		ret->v.func = &c_fun;
+		return ret;
 	default:
 		fprintf(stderr, "Parse error: unexpected %c (0x%02x).\n", ch, ch);
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
 }
 
@@ -294,6 +304,12 @@ void print_fun(fun *func) {
 		} else {
 			printf(".%c", func->v.toprint);
 		}
+		break;
+	case SEE:
+		putchar('c');
+		break;
+	case CONT:
+		printf("<cont>");
 		break;
 	default:
 		printf("(corrupted memory)");
@@ -475,6 +491,23 @@ void apply(fun *func, fun *arg, cont *c) {
 		fun_decref(func);
 		/* No fun_decref(arg) nor cont_decref(c) because we gave them to next */
 		eval(e, next);
+		break;
+	}
+	case SEE:
+	{
+		fun *f = make_fun();
+		f->type = CONT;
+		f->v.cont = cont_addref(c);
+		/* No fun_decref(func) because it's builtin, no fun_decref(arg) because we're giving it to apply */
+		apply(arg, f, c);
+		break;
+	}
+	case CONT:
+	{
+		cont *next = cont_addref(func->v.cont);
+		fun_decref(func);
+		cont_decref(c);
+		toss(next, arg);
 		break;
 	}
 	default:

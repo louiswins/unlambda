@@ -17,13 +17,12 @@ They are included mostly to make it harder to understand.
 ## This implementation
 
 This implementation is my first attempt at coding an interpreter for Unlambda.
-It includes all the core functions except `c` (call/cc) from Unlambda 1.
+It includes all the core functions from Unlambda 1 but is missing the four (3 +
+256 if you count every `?x` function separately) Unlambda 2 functions.
 
 Currently it is written in continuation-passing style, but I use the C call
 stack as the Unlambda call stack so there is a definite propensity to blowing
 the stack. This is actually a lot worse than the old version, because nothing
 ever returns - I can only calculate about 8 fibonacci numbers with the example
-program before I get a stack overflow on my machine.
-
-Next I plan to implement `c` (theoretically it should be easy now, right?
-RIGHT?) and then add a trampoline so I don't use so much stack.
+program before I get a stack overflow on my machine. The next step therefore is
+to rewrite it in terms of a trampoline.
