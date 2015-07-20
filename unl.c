@@ -25,16 +25,17 @@ void my_free(void *ptr) {
 
 typedef struct expr expr;
 typedef struct fun fun;
+typedef struct cont cont;
 
 /* A "function": i or .x or `sk or something like that. */
 struct fun {
 	int refcount;
 	enum { KAY, KAY1, ESS, ESS1, ESS2, EYE, VEE, DEE, DEE1, DOT } type;
 	union {
-		fun *onefunc;
-		struct { fun *f1, *f2; } twofunc;
-		expr *expr;
-		char toprint;
+		fun *onefunc; /* for KAY1 and ESS1: `k(onefunc) or `s(onefunc) */
+		struct { fun *f1, *f2; } twofunc; /* for ESS2: ``s(f1)(f2) */
+		expr *expr; /* for DEE1: `d(expr) */
+		char toprint; /* for DOT: .(toprint) */
 	} v;
 };
 
@@ -48,13 +49,29 @@ struct expr {
 	} v;
 };
 
+/* A "continuation": what to do next. You'll toss it a fun*.
+   EVAL_APPLY: get "func", eval "e", apply "func" to "e", next()
+   APPLY: get "arg", apply "f" to "arg", next()
+   APPLY_DEE: get "func", apply "func" to "f", next()
+   TERM: terminate execution */
+struct cont {
+	int refcount;
+	enum { EVAL_APPLY, APPLY, APPLY_DEE, TERM } type;
+	union {
+		expr *e;
+		fun *f;
+	} v;
+	cont *next;
+};
+
 fun *fun_addref(fun *f);
 void fun_decref(fun *f);
 expr *expr_addref(expr *e);
 void expr_decref(expr *e);
+cont *cont_addref(cont *c);
+void cont_decref(cont *c);
 
 #define IS_STATIC_FUN_TYPE(type) ((type) == KAY || (type) == ESS || (type) == EYE || (type) == VEE || (type) == DEE)
-
 fun *fun_addref(fun *f) {
 	if (!IS_STATIC_FUN_TYPE(f->type))
 		f->refcount++;
@@ -110,12 +127,42 @@ void expr_decref(expr *e) {
 	}
 }
 
+#define IS_STATIC_CONT_TYPE(type) ((type) == TERM)
+cont *cont_addref(cont *c) {
+	if (!IS_STATIC_CONT_TYPE(c->type)) {
+		c->refcount++;
+	}
+	return c;
+}
+void cont_decref(cont *c) {
+	if (IS_STATIC_CONT_TYPE(c->type)) return;
+	c->refcount--;
+	if (c->refcount == 0) {
+		switch (c->type) {
+		case EVAL_APPLY:
+			expr_decref(c->v.e);
+			break;
+		case APPLY:
+		case APPLY_DEE:
+			fun_decref(c->v.f);
+			break;
+		default:
+			fprintf(stderr, "Memory corruption at %s\n", __LINE__);
+			return;
+		}
+		cont_decref(c->next);
+		free(c);
+	}
+}
+
 
 fun s_fun = { 1, ESS };
 fun k_fun = { 1, KAY };
 fun i_fun = { 1, EYE };
 fun v_fun = { 1, VEE };
 fun d_fun = { 1, DEE };
+
+cont term_c = { 1, TERM };
 
 void unexpected_eof() {
 	fprintf(stderr, "Parsing error: unexpected EOF.\n");
@@ -130,6 +177,12 @@ expr *make_expr() {
 fun *make_fun() {
 	fun *ret = malloc(sizeof(*ret));
 	ret->refcount = 1;
+	return ret;
+}
+cont *make_cont(cont *next) {
+	cont *ret = malloc(sizeof(*ret));
+	ret->refcount = 1;
+	ret->next = next;
 	return ret;
 }
 
@@ -264,33 +317,97 @@ void print_expr(expr *prog) {
 	}
 }
 
+void toss(cont *c, fun *arg);
+void apply(fun *func, fun *arg, cont *c);
+void eval(expr *e, cont *c);
+void end_the_program(fun *result);
 
+/* Toss val to the continuation c */
+void toss(cont *c, fun *val) {
+	switch (c->type) {
+	case EVAL_APPLY:
+		if (val->type == DEE) {
+			cont *next = cont_addref(c->next);
+			fun *f = make_fun();
+			f->type = DEE1;
+			f->v.expr = expr_addref(c->v.e);
+			cont_decref(c);
+			/* no fun_decref(arg) because it's builtin */
+			toss(next, f);
+		} else {
+			cont *next = make_cont(cont_addref(c->next));
+			expr *e = expr_addref(c->v.e);
+			next->type = APPLY;
+			next->v.f = val; /* no addref because we're about to decref it anyway */
+			cont_decref(c);
+			eval(e, next);
+		}
+		return;
+	case APPLY:
+	{
+		cont *next = cont_addref(c->next);
+		fun *func = fun_addref(c->v.f);
+		cont_decref(c);
+		apply(func, val, next);
+		return;
+	}
+	case APPLY_DEE:
+	{
+		cont *next = cont_addref(c->next);
+		fun *arg = fun_addref(c->v.f);
+		cont_decref(c);
+		apply(val, arg, next);
+		return;
+	}
+	case TERM:
+		end_the_program(val);
+		return;
+	default:
+		fprintf(stderr, "Memory corruption at %s\n", __LINE__);
+		return;
+	}
+}
 
-fun *apply(fun *func, fun *arg);
-fun *eval(expr *e);
-
-fun *apply(fun *func, fun *arg) {
-	fun *ret;
+/* apply "func" to "arg", tossing the result to "c" */
+void apply(fun *func, fun *arg, cont *c) {
 	switch (func->type) {
 	case KAY:
-		ret = make_fun();
-		ret->type = KAY1;
-		ret->v.onefunc = fun_addref(arg);
+	{
+		fun *val = make_fun();
+		val->type = KAY1;
+		val->v.onefunc = arg;
+		/* No fun_decref(func) because it's builtin, no fun_decref(arg) because we gave it to val */
+		toss(c, val);
 		break;
+	}
 	case KAY1:
-		ret = fun_addref(func->v.onefunc);
+	{
+		fun *val = fun_addref(func->v.onefunc);
+		fun_decref(func);
+		fun_decref(arg);
+		toss(c, val);
 		break;
+	}
 	case ESS:
-		ret = make_fun();
-		ret->type = ESS1;
-		ret->v.onefunc = fun_addref(arg);
+	{
+		fun *val = make_fun();
+		val->type = ESS1;
+		val->v.onefunc = arg;
+		/* No fun_decref(func) because it's builtin, no fun_decref(arg) because we gave it to val */
+		toss(c, val);
 		break;
+	}
 	case ESS1:
-		ret = make_fun();
-		ret->type = ESS2;
-		ret->v.twofunc.f1 = fun_addref(func->v.onefunc);
-		ret->v.twofunc.f2 = fun_addref(arg);
+	{
+		fun *val = make_fun();
+		val->type = ESS2;
+		val->v.twofunc.f1 = fun_addref(func->v.onefunc);
+		val->v.twofunc.f2 = arg;
+		fun_decref(func);
+		/* No fun_decref(arg) because we gave it to val */
+		toss(c, val);
 		break;
+	}
 	case ESS2:
 	{
 		/* Because of the possibility of seeing d somewhere, we'll carefully
@@ -307,110 +424,98 @@ fun *apply(fun *func, fun *arg) {
 		ey->type = FUNCTION;
 		ey->v.func = fun_addref(func->v.twofunc.f2);
 		ez->type = FUNCTION;
-		ez->v.func = fun_addref(arg);
+		ez->v.func = arg; /* No fun_addref because we're giving it away */
 
 		es1->type = APPLICATION;
-		es1->v.ap.func = expr_addref(ex);
-		es1->v.ap.arg = expr_addref(ez);
+		es1->v.ap.func = ex;
+		es1->v.ap.arg = expr_addref(ez); /* This one is an extra reference */
 		es2->type = APPLICATION;
-		es2->v.ap.func = expr_addref(ey);
-		es2->v.ap.arg = expr_addref(ez);
-
-		expr_decref(ex);
-		expr_decref(ey);
-		expr_decref(ez);
+		es2->v.ap.func = ey;
+		es2->v.ap.arg = ez; /* This one we're giving away */
 
 		e->type = APPLICATION;
-		e->v.ap.func = expr_addref(es1);
-		e->v.ap.arg = expr_addref(es2);
-
-		expr_decref(es1);
-		expr_decref(es2);
-
-		ret = eval(expr_addref(e));
-
-		expr_decref(e);
+		e->v.ap.func = es1;
+		e->v.ap.arg = es2;
+		
+		fun_decref(func);
+		/* No fun_decref(arg) because we gave it away */
+		eval(e, c);
 		break;
 	}
 	case DOT:
 		putchar(func->v.toprint);
-		ret = fun_addref(arg);
+		fun_decref(func);
+		toss(c, arg);
 		break;
 	case DEE:
 	{
 		expr *e = make_expr();
+		fun *val = make_fun();
 		e->type = FUNCTION;
-		e->v.func = fun_addref(arg);
-		ret = make_fun();
-		ret->type = DEE1;
-		ret->v.expr = e;
+		e->v.func = arg;
+		val->type = DEE1;
+		val->v.expr = e;
+		/* No fun_decref(func) because it's builtin, no fun_decref(arg) because we gave it to e */
+		toss(c, val);
 		break;
 	}
 	case EYE:
-		ret = fun_addref(arg);
+		toss(c, arg);
 		break;
 	case VEE:
-		ret = func; /* fun_addref unneeded because it's a builtin */
+		fun_decref(arg);
+		toss(c, func); /* fun_addref unneeded because it's a builtin */
 		break;
 	case DEE1:
 	{
-		fun *action = eval(expr_addref(func->v.expr));
-		if (action->type == DEE) {
-			expr *e = make_expr();
-			e->type = FUNCTION;
-			e->v.func = fun_addref(arg);
-			ret = make_fun();
-			ret->type = DEE1;
-			ret->v.expr = e;
-		} else {
-			ret = apply(fun_addref(action), fun_addref(arg));
-		}
-		fun_decref(action);
+		cont *next = make_cont(c);
+		expr *e = expr_addref(func->v.expr);
+		next->type = APPLY_DEE;
+		next->v.f = arg;
+		fun_decref(func);
+		/* No fun_decref(arg) nor cont_decref(c) because we gave them to next */
+		eval(e, next);
 		break;
 	}
 	default:
 		fprintf(stderr, "Memory corruption at %d. Acting like i.\n", __LINE__);
-		ret = fun_addref(arg);
+		toss(c, arg);
 		break;
 	}
-	fun_decref(func);
-	fun_decref(arg);
-	return ret;
 }
 
-fun *eval(expr *e) {
-	fun *ret;
+/* evaluate "e", tossing the result to "c" */
+void eval(expr *e, cont *c) {
 	if (e->type == FUNCTION) {
-		ret = fun_addref(e->v.func);
+		fun *f = fun_addref(e->v.func);
+		expr_decref(e);
+		toss(c, f);
 	} else { /* e->type == APPLICATION */
-		fun *func = eval(expr_addref(e->v.ap.func));
-		if (func->type == DEE) {
-			ret = make_fun();
-			ret->type = DEE1;
-			ret->v.expr = expr_addref(e->v.ap.arg);
-		} else {
-			fun *arg = eval(expr_addref(e->v.ap.arg));
-			ret = apply(fun_addref(func), fun_addref(arg));
-			fun_decref(arg);
-		}
-		fun_decref(func);
+		cont *next = make_cont(c);
+		next->type = EVAL_APPLY;
+		next->v.e = expr_addref(e->v.ap.arg);
+		expr *func = expr_addref(e->v.ap.func);
+		expr_decref(e);
+		eval(func, next);
 	}
-	expr_decref(e);
-	return ret;
 }
 
 int main() {
-	fun *ret;
-
+	cont *c = &term_c; /* will call end_the_program() once execution is complete */
 	expr *prog = parse();
-	ret = eval(prog); /* no expr_addref() because we don't use prog afterwards. */
 
+	eval(prog, c);
+
+	return 0;
+}
+
+void end_the_program(fun *result) {
 	printf("\nResult: ");
-	print_fun(ret);
+	print_fun(result);
 	putchar('\n');
 
 #ifndef NDEBUG
-	fun_decref(ret);
+	fun_decref(result);
 
 	printf("\nSTATS:\n%lu allocations\n%lu frees\n", (unsigned long)n_mallocs, (unsigned long)n_frees);
 	if (n_mallocs > n_frees) {
@@ -419,5 +524,4 @@ int main() {
 		printf("DOUBLE FREE!\n");
 	}
 #endif
-	return 0;
 }
