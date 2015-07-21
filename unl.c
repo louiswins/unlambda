@@ -28,15 +28,17 @@ typedef struct fun fun;
 typedef struct cont cont;
 typedef struct action action;
 
+static int current_character = EOF;
+
 /* A "function": i or .x or `sk or something like that. */
 struct fun {
 	int refcount;
-	enum { KAY, KAY1, ESS, ESS1, ESS2, EYE, VEE, DEE, DEE1, DOT, SEE, CONT } type;
+	enum { KAY, KAY1, ESS, ESS1, ESS2, EYE, VEE, DEE, DEE1, DOT, SEE, CONT, EE, AT, QUESTION, PIPE } type;
 	union {
 		fun *onefunc; /* for KAY1 and ESS1: `k(onefunc) or `s(onefunc) */
 		struct { fun *f1, *f2; } twofunc; /* for ESS2: ``s(f1)(f2) */
 		expr *expr; /* for DEE1: `d(expr) */
-		char toprint; /* for DOT: .(toprint) */
+		char ch; /* for DOT and QUESTION: .(ch) or ?(ch) */
 		cont *cont;
 	} v;
 };
@@ -85,7 +87,7 @@ void expr_decref(expr *e);
 cont *cont_addref(cont *c);
 void cont_decref(cont *c);
 
-#define IS_STATIC_FUN_TYPE(type) ((type) == KAY || (type) == ESS || (type) == EYE || (type) == VEE || (type) == DEE || (type) == SEE)
+#define IS_STATIC_FUN_TYPE(type) ((type) == KAY || (type) == ESS || (type) == EYE || (type) == VEE || (type) == DEE || (type) == SEE || (type) == EE || (type) == AT || (type) == PIPE)
 fun *fun_addref(fun *f) {
 	if (!IS_STATIC_FUN_TYPE(f->type))
 		f->refcount++;
@@ -109,6 +111,7 @@ void fun_decref(fun *f) {
 			expr_decref(f->v.expr);
 			break;
 		case DOT:
+		case QUESTION:
 			break;
 		case CONT:
 			cont_decref(f->v.cont);
@@ -173,12 +176,15 @@ void cont_decref(cont *c) {
 }
 
 
-fun s_fun = { 1, ESS };
-fun k_fun = { 1, KAY };
-fun i_fun = { 1, EYE };
-fun v_fun = { 1, VEE };
-fun d_fun = { 1, DEE };
-fun c_fun = { 1, SEE };
+fun s_fun    = { 1, ESS  };
+fun k_fun    = { 1, KAY  };
+fun i_fun    = { 1, EYE  };
+fun v_fun    = { 1, VEE  };
+fun d_fun    = { 1, DEE  };
+fun c_fun    = { 1, SEE  };
+fun e_fun    = { 1, EE   };
+fun at_fun   = { 1, AT   };
+fun pipe_fun = { 1, PIPE };
 
 cont term_c = { 1, TERM };
 
@@ -249,14 +255,14 @@ expr* parse() {
 		ret->type = FUNCTION;
 		ret->v.func = make_fun();
 		ret->v.func->type = DOT;
-		ret->v.func->v.toprint = ch;
+		ret->v.func->v.ch = ch;
 		return ret;
 	case 'r':
 	case 'R':
 		ret->type = FUNCTION;
 		ret->v.func = make_fun();
 		ret->v.func->type = DOT;
-		ret->v.func->v.toprint = '\n';
+		ret->v.func->v.ch = '\n';
 		return ret;
 	case 'd':
 	case 'D':
@@ -267,6 +273,27 @@ expr* parse() {
 	case 'C':
 		ret->type = FUNCTION;
 		ret->v.func = &c_fun;
+		return ret;
+	case 'e':
+	case 'E':
+		ret->type = FUNCTION;
+		ret->v.func = &e_fun;
+		return ret;
+	case '@':
+		ret->type = FUNCTION;
+		ret->v.func = &at_fun;
+		return ret;
+	case '?':
+		ch = getchar();
+		if (ch == EOF) unexpected_eof();
+		ret->type = FUNCTION;
+		ret->v.func = make_fun();
+		ret->v.func->type = QUESTION;
+		ret->v.func->v.ch = ch;
+		return ret;
+	case '|':
+		ret->type = FUNCTION;
+		ret->v.func = &pipe_fun;
 		return ret;
 	default:
 		fprintf(stderr, "Parse error: unexpected %c (0x%02x).\n", ch, ch);
@@ -312,10 +339,10 @@ void print_fun(fun *func) {
 		print_expr(func->v.expr);
 		break;
 	case DOT:
-		if (func->v.toprint == '\n') {
+		if (func->v.ch == '\n') {
 			putchar('r');
 		} else {
-			printf(".%c", func->v.toprint);
+			printf(".%c", func->v.ch);
 		}
 		break;
 	case SEE:
@@ -323,6 +350,18 @@ void print_fun(fun *func) {
 		break;
 	case CONT:
 		printf("<cont>");
+		break;
+	case EE:
+		putchar('e');
+		break;
+	case AT:
+		putchar('@');
+		break;
+	case QUESTION:
+		printf("?%c", func->v.ch);
+		break;
+	case PIPE:
+		putchar('|');
 		break;
 	default:
 		printf("(corrupted memory)");
@@ -484,7 +523,7 @@ action apply(fun *func, fun *arg, cont *c) {
 		return do_eval(e, c);
 	}
 	case DOT:
-		putchar(func->v.toprint);
+		putchar(func->v.ch);
 		fun_decref(func);
 		return do_toss(c, arg);
 	case DEE:
@@ -528,6 +567,35 @@ action apply(fun *func, fun *arg, cont *c) {
 		cont_decref(c);
 		return do_toss(next, arg);
 	}
+	case EE:
+		cont_decref(c);
+		return do_end(arg);
+	case AT:
+		current_character = getchar();
+		if (current_character == EOF) {
+			return do_apply(arg, &v_fun, c);
+		} else {
+			return do_apply(arg, &i_fun, c);
+		}
+	case QUESTION:
+	{
+		int ok = func->v.ch == current_character;
+		fun_decref(func);
+		if (ok) {
+			return do_apply(arg, &i_fun, c);
+		} else {
+			return do_apply(arg, &v_fun, c);
+		}
+	}
+	case PIPE:
+		if (current_character == EOF) {
+			return do_apply(arg, &v_fun, c);
+		} else {
+			fun *dot = make_fun();
+			dot->type = DOT;
+			dot->v.ch = current_character;
+			return do_apply(arg, dot, c);
+		}
 	default:
 		fprintf(stderr, "Memory corruption at %d. Acting like i.\n", __LINE__);
 		return do_toss(c, arg);
