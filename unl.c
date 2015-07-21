@@ -26,6 +26,7 @@ void my_free(void *ptr) {
 typedef struct expr expr;
 typedef struct fun fun;
 typedef struct cont cont;
+typedef struct action action;
 
 /* A "function": i or .x or `sk or something like that. */
 struct fun {
@@ -63,6 +64,18 @@ struct cont {
 		fun *f;
 	} v;
 	cont *next;
+};
+
+/* An "action": which function to call next.
+   This is used entirely to remove stack overflows. */
+struct action {
+	enum { ACT_TOSS, ACT_APPLY, ACT_EVAL, ACT_END } type;
+	cont *c;
+	union {
+		fun *to;
+		struct { fun *f1, *f2; } ap;
+		expr *ev;
+	} v;
 };
 
 fun *fun_addref(fun *f);
@@ -333,13 +346,34 @@ void print_expr(expr *prog) {
 	}
 }
 
-void toss(cont *c, fun *arg);
-void apply(fun *func, fun *arg, cont *c);
-void eval(expr *e, cont *c);
-void end_the_program(fun *result);
+action toss(cont *c, fun *arg);
+action apply(fun *func, fun *arg, cont *c);
+action eval(expr *e, cont *c);
+
+action do_toss(cont *c, fun *arg) {
+	action ret = { ACT_TOSS, c };
+	ret.v.to = arg;
+	return ret;
+}
+action do_apply(fun *func, fun *arg, cont *c) {
+	action ret = { ACT_APPLY, c };
+	ret.v.ap.f1 = func;
+	ret.v.ap.f2 = arg;
+	return ret;
+}
+action do_eval(expr *e, cont *c) {
+	action ret = { ACT_EVAL, c };
+	ret.v.ev = e;
+	return ret;
+}
+action do_end(fun *result) {
+	action ret = { ACT_END };
+	ret.v.to = result;
+	return ret;
+}
 
 /* Toss val to the continuation c */
-void toss(cont *c, fun *val) {
+action toss(cont *c, fun *val) {
 	switch (c->type) {
 	case EVAL_APPLY:
 		if (val->type == DEE) {
@@ -349,43 +383,39 @@ void toss(cont *c, fun *val) {
 			f->v.expr = expr_addref(c->v.e);
 			cont_decref(c);
 			/* no fun_decref(arg) because it's builtin */
-			toss(next, f);
+			return do_toss(next, f);
 		} else {
 			cont *next = make_cont(cont_addref(c->next));
 			expr *e = expr_addref(c->v.e);
 			next->type = APPLY;
 			next->v.f = val; /* no addref because we're about to decref it anyway */
 			cont_decref(c);
-			eval(e, next);
+			return do_eval(e, next);
 		}
-		return;
 	case APPLY:
 	{
 		cont *next = cont_addref(c->next);
 		fun *func = fun_addref(c->v.f);
 		cont_decref(c);
-		apply(func, val, next);
-		return;
+		return do_apply(func, val, next);
 	}
 	case APPLY_DEE:
 	{
 		cont *next = cont_addref(c->next);
 		fun *arg = fun_addref(c->v.f);
 		cont_decref(c);
-		apply(val, arg, next);
-		return;
+		return do_apply(val, arg, next);
 	}
 	case TERM:
-		end_the_program(val);
-		return;
+		return do_end(val);
 	default:
 		fprintf(stderr, "Memory corruption at %d\n", __LINE__);
-		return;
+		return do_end(val);
 	}
 }
 
 /* apply "func" to "arg", tossing the result to "c" */
-void apply(fun *func, fun *arg, cont *c) {
+action apply(fun *func, fun *arg, cont *c) {
 	switch (func->type) {
 	case KAY:
 	{
@@ -393,16 +423,14 @@ void apply(fun *func, fun *arg, cont *c) {
 		val->type = KAY1;
 		val->v.onefunc = arg;
 		/* No fun_decref(func) because it's builtin, no fun_decref(arg) because we gave it to val */
-		toss(c, val);
-		break;
+		return do_toss(c, val);
 	}
 	case KAY1:
 	{
 		fun *val = fun_addref(func->v.onefunc);
 		fun_decref(func);
 		fun_decref(arg);
-		toss(c, val);
-		break;
+		return do_toss(c, val);
 	}
 	case ESS:
 	{
@@ -410,8 +438,7 @@ void apply(fun *func, fun *arg, cont *c) {
 		val->type = ESS1;
 		val->v.onefunc = arg;
 		/* No fun_decref(func) because it's builtin, no fun_decref(arg) because we gave it to val */
-		toss(c, val);
-		break;
+		return do_toss(c, val);
 	}
 	case ESS1:
 	{
@@ -421,8 +448,7 @@ void apply(fun *func, fun *arg, cont *c) {
 		val->v.twofunc.f2 = arg;
 		fun_decref(func);
 		/* No fun_decref(arg) because we gave it to val */
-		toss(c, val);
-		break;
+		return do_toss(c, val);
 	}
 	case ESS2:
 	{
@@ -452,17 +478,15 @@ void apply(fun *func, fun *arg, cont *c) {
 		e->type = APPLICATION;
 		e->v.ap.func = es1;
 		e->v.ap.arg = es2;
-		
+
 		fun_decref(func);
 		/* No fun_decref(arg) because we gave it away */
-		eval(e, c);
-		break;
+		return do_eval(e, c);
 	}
 	case DOT:
 		putchar(func->v.toprint);
 		fun_decref(func);
-		toss(c, arg);
-		break;
+		return do_toss(c, arg);
 	case DEE:
 	{
 		expr *e = make_expr();
@@ -472,16 +496,13 @@ void apply(fun *func, fun *arg, cont *c) {
 		val->type = DEE1;
 		val->v.expr = e;
 		/* No fun_decref(func) because it's builtin, no fun_decref(arg) because we gave it to e */
-		toss(c, val);
-		break;
+		return do_toss(c, val);
 	}
 	case EYE:
-		toss(c, arg);
-		break;
+		return do_toss(c, arg);
 	case VEE:
 		fun_decref(arg);
-		toss(c, func); /* fun_addref unneeded because it's a builtin */
-		break;
+		return do_toss(c, func); /* fun_addref unneeded because it's a builtin */
 	case DEE1:
 	{
 		cont *next = make_cont(c);
@@ -490,8 +511,7 @@ void apply(fun *func, fun *arg, cont *c) {
 		next->v.f = arg;
 		fun_decref(func);
 		/* No fun_decref(arg) nor cont_decref(c) because we gave them to next */
-		eval(e, next);
-		break;
+		return do_eval(e, next);
 	}
 	case SEE:
 	{
@@ -499,56 +519,64 @@ void apply(fun *func, fun *arg, cont *c) {
 		f->type = CONT;
 		f->v.cont = cont_addref(c);
 		/* No fun_decref(func) because it's builtin, no fun_decref(arg) because we're giving it to apply */
-		apply(arg, f, c);
-		break;
+		return do_apply(arg, f, c);
 	}
 	case CONT:
 	{
 		cont *next = cont_addref(func->v.cont);
 		fun_decref(func);
 		cont_decref(c);
-		toss(next, arg);
-		break;
+		return do_toss(next, arg);
 	}
 	default:
 		fprintf(stderr, "Memory corruption at %d. Acting like i.\n", __LINE__);
-		toss(c, arg);
-		break;
+		return do_toss(c, arg);
 	}
 }
 
 /* evaluate "e", tossing the result to "c" */
-void eval(expr *e, cont *c) {
+action eval(expr *e, cont *c) {
 	if (e->type == FUNCTION) {
 		fun *f = fun_addref(e->v.func);
 		expr_decref(e);
-		toss(c, f);
+		return do_toss(c, f);
 	} else { /* e->type == APPLICATION */
 		cont *next = make_cont(c);
 		next->type = EVAL_APPLY;
 		next->v.e = expr_addref(e->v.ap.arg);
 		expr *func = expr_addref(e->v.ap.func);
 		expr_decref(e);
-		eval(func, next);
+		return do_eval(func, next);
 	}
 }
 
 int main() {
-	cont *c = &term_c; /* will call end_the_program() once execution is complete */
 	expr *prog = parse();
+	action current_action = eval(prog, &term_c);
 
-	eval(prog, c);
+	while (current_action.type != ACT_END) {
+		switch (current_action.type) {
+		case ACT_TOSS:
+			current_action = toss(current_action.c, current_action.v.to);
+			break;
+		case ACT_APPLY:
+			current_action = apply(current_action.v.ap.f1, current_action.v.ap.f2, current_action.c);
+			break;
+		case ACT_EVAL:
+			current_action = eval(current_action.v.ev, current_action.c);
+			break;
+		default:
+			fprintf(stderr, "Memory corruption at %d\n", __LINE__);
+			exit(EXIT_FAILURE);
+		}
+	}
 
-	return 0;
-}
-
-void end_the_program(fun *result) {
 	printf("\nResult: ");
-	print_fun(result);
+	print_fun(current_action.v.to);
 	putchar('\n');
 
 #ifndef NDEBUG
-	fun_decref(result);
+	fun_decref(current_action.v.to);
 
 	printf("\nSTATS:\n%lu allocations\n%lu frees\n", (unsigned long)n_mallocs, (unsigned long)n_frees);
 	if (n_mallocs > n_frees) {
@@ -557,4 +585,6 @@ void end_the_program(fun *result) {
 		printf("DOUBLE FREE!\n");
 	}
 #endif
+
+	return 0;
 }
