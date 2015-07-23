@@ -1,32 +1,25 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <ctype.h>
 
-#ifndef NDEBUG
-size_t n_mallocs = 0;
-size_t n_frees = 0;
-void *my_malloc(size_t size) {
-	void *ret = malloc(size);
-	++n_mallocs;
-	if (ret == NULL) {
-		fprintf(stderr, "OUT OF MEMORY: %lu mallocs, %lu frees\n", (unsigned long)n_mallocs, (unsigned long)n_frees);
-		exit(EXIT_FAILURE);
-	}
-	return ret;
-}
-void my_free(void *ptr) {
-	++n_frees;
-	free(ptr);
-}
-
-#define malloc my_malloc
-#define free my_free
+#ifdef __GNUC__
+__attribute__((noreturn))
+#elif defined(_MSC_VER)
+__declspec(noreturn)
 #endif
+void panic(char *fmt, ...) {
+	va_list args;
+	va_start(args, fmt);
+	vfprintf(stderr, fmt, args);
+	va_end(args);
+	exit(EXIT_FAILURE);
+}
 
 typedef struct expr expr;
 typedef struct fun fun;
 typedef struct cont cont;
-typedef struct action action;
+typedef struct anything anything;
 
 static int current_character = EOF;
 
@@ -68,26 +61,53 @@ struct cont {
 	cont *next;
 };
 
-/* An "action": which function to call next.
-   This is used entirely to remove stack overflows. */
-struct action {
-	enum { ACT_TOSS, ACT_APPLY, ACT_EVAL, ACT_END } type;
-	cont *c;
+/* Anything: used for memory allocation. */
+struct anything {
 	union {
-		fun *to;
-		struct { fun *f1, *f2; } ap;
-		expr *ev;
-	} v;
+		anything *next;
+		fun dummy_f;
+		expr dummy_expr;
+		cont dummy_cont;
+	};
 };
 
-fun *fun_addref(fun *f);
+static anything *mempool = NULL;
+static size_t size_to_malloc = 1024;
+void *get_something() {
+	anything *ret = mempool;
+	if (mempool == NULL) {
+		size_t i;
+		ret = mempool = malloc(size_to_malloc * sizeof(*mempool));
+		if (mempool == NULL) panic("Out of memory\n");
+		for (i = 0; i < size_to_malloc - 1; ++i) {
+			mempool[i].next = &mempool[i + 1];
+		}
+		mempool[size_to_malloc - 1].next = NULL;
+		size_to_malloc += size_to_malloc / 2 + 64;
+		/* If you carefully study this program, you'll see that we never free anything. Yep, we'll leak this and
+		   that's okay - we probably wouldn't free it until the very end of the program anyway.
+		   If we allocate a bunch of objects and then free them and then keep running for a long time we'll waste
+		   memory, but that isn't a popular usage pattern for Unlambda programs. */
+	}
+	mempool = mempool->next;
+	return ret;
+}
+void free_something(void *thing) {
+	((anything*)thing)->next = mempool;
+	mempool = thing;
+}
+
+
 void fun_decref(fun *f);
-expr *expr_addref(expr *e);
 void expr_decref(expr *e);
-cont *cont_addref(cont *c);
 void cont_decref(cont *c);
 
 #define IS_STATIC_FUN_TYPE(type) ((type) == KAY || (type) == ESS || (type) == EYE || (type) == VEE || (type) == DEE || (type) == SEE || (type) == EE || (type) == AT || (type) == PIPE)
+fun *make_fun() {
+	fun *ret = get_something();
+	ret->refcount = 1;
+	return ret;
+}
 fun *fun_addref(fun *f) {
 	if (!IS_STATIC_FUN_TYPE(f->type))
 		f->refcount++;
@@ -120,10 +140,15 @@ void fun_decref(fun *f) {
 			fprintf(stderr, "Memory corruption at %d\n", __LINE__);
 			return;
 		}
-		free(f);
+		free_something(f);
 	}
 }
 
+expr *make_expr() {
+	expr *ret = get_something();
+	ret->refcount = 1;
+	return ret;
+}
 expr *expr_addref(expr *e) {
 	e->refcount++;
 	return e;
@@ -143,11 +168,17 @@ void expr_decref(expr *e) {
 			fprintf(stderr, "Memory corruption at %d\n", __LINE__);
 			return;
 		}
-		free(e);
+		free_something(e);
 	}
 }
 
 #define IS_STATIC_CONT_TYPE(type) ((type) == TERM)
+cont *make_cont(cont *next) {
+	cont *ret = get_something();
+	ret->refcount = 1;
+	ret->next = next;
+	return ret;
+}
 cont *cont_addref(cont *c) {
 	if (!IS_STATIC_CONT_TYPE(c->type)) {
 		c->refcount++;
@@ -171,7 +202,7 @@ void cont_decref(cont *c) {
 			return;
 		}
 		cont_decref(c->next);
-		free(c);
+		free_something(c);
 	}
 }
 
@@ -188,34 +219,12 @@ fun pipe_fun = { 1, PIPE };
 
 cont term_c = { 1, TERM };
 
-void unexpected_eof() {
-	fprintf(stderr, "Parsing error: unexpected EOF.\n");
-	exit(1);
-}
-
-expr *make_expr() {
-	expr *ret = malloc(sizeof(*ret));
-	ret->refcount = 1;
-	return ret;
-}
-fun *make_fun() {
-	fun *ret = malloc(sizeof(*ret));
-	ret->refcount = 1;
-	return ret;
-}
-cont *make_cont(cont *next) {
-	cont *ret = malloc(sizeof(*ret));
-	ret->refcount = 1;
-	ret->next = next;
-	return ret;
-}
-
 expr* parse() {
 	int ch;
 	expr *ret = make_expr();
 	for (;;) {
 		ch = getchar();
-		if (ch == EOF) unexpected_eof();
+		if (ch == EOF) panic("Error: unexpected EOF.\n");
 		if (isspace(ch)) continue;
 		if (ch == '#') {
 			while ((ch = getchar()) != EOF && ch != '\n');
@@ -251,7 +260,7 @@ expr* parse() {
 		return ret;
 	case '.':
 		ch = getchar();
-		if (ch == EOF) unexpected_eof();
+		if (ch == EOF) panic("Expected character for '.'\n");
 		ret->type = FUNCTION;
 		ret->v.func = make_fun();
 		ret->v.func->type = DOT;
@@ -285,7 +294,7 @@ expr* parse() {
 		return ret;
 	case '?':
 		ch = getchar();
-		if (ch == EOF) unexpected_eof();
+		if (ch == EOF) panic("Expected character for '?'\n");
 		ret->type = FUNCTION;
 		ret->v.func = make_fun();
 		ret->v.func->type = QUESTION;
@@ -296,8 +305,7 @@ expr* parse() {
 		ret->v.func = &pipe_fun;
 		return ret;
 	default:
-		fprintf(stderr, "Parse error: unexpected %c (0x%02x).\n", ch, ch);
-		exit(EXIT_FAILURE);
+		panic("Parse error: unexpected %c (0x%02x).\n", ch, ch);
 	}
 }
 
@@ -385,34 +393,45 @@ void print_expr(expr *prog) {
 	}
 }
 
-action toss(cont *c, fun *arg);
-action apply(fun *func, fun *arg, cont *c);
-action eval(expr *e, cont *c);
 
-action do_toss(cont *c, fun *arg) {
-	action ret = { ACT_TOSS, c };
-	ret.v.to = arg;
-	return ret;
-}
-action do_apply(fun *func, fun *arg, cont *c) {
-	action ret = { ACT_APPLY, c };
-	ret.v.ap.f1 = func;
-	ret.v.ap.f2 = arg;
-	return ret;
-}
-action do_eval(expr *e, cont *c) {
-	action ret = { ACT_EVAL, c };
-	ret.v.ev = e;
-	return ret;
-}
-action do_end(fun *result) {
-	action ret = { ACT_END };
-	ret.v.to = result;
-	return ret;
-}
+/* An "action": which function to call next.
+   This is used entirely to remove stack overflows. */
+struct action {
+	enum { ACT_TOSS, ACT_APPLY, ACT_EVAL, ACT_END } type;
+	cont *c;
+	union {
+		fun *to;
+		struct { fun *f1, *f2; } ap;
+		expr *ev;
+	} v;
+} current_action;
+
+/* These are super gross macros, but they are only supposed to be used in tail-call position.
+   Unfortunately I can't do return void_returning_fn(); or I would do that. */
+#define return_toss(ctn, arg)         \
+	current_action.type = ACT_TOSS;   \
+	current_action.c = (ctn);         \
+	current_action.v.to = (arg);      \
+	return
+#define return_apply(func, arg, ctn)  \
+	current_action.type = ACT_APPLY;  \
+	current_action.c = (ctn);         \
+	current_action.v.ap.f1 = (func);  \
+	current_action.v.ap.f2 = (arg);   \
+	return
+#define return_eval(e, ctn)           \
+	current_action.type = ACT_EVAL;   \
+	current_action.c = (ctn);         \
+	current_action.v.ev = (e);        \
+	return
+#define return_end(result)            \
+	current_action.type = ACT_END;    \
+	current_action.v.to = (result);   \
+	return
+
 
 /* Toss val to the continuation c */
-action toss(cont *c, fun *val) {
+void toss(cont *c, fun *val) {
 	switch (c->type) {
 	case EVAL_APPLY:
 		if (val->type == DEE) {
@@ -422,39 +441,38 @@ action toss(cont *c, fun *val) {
 			f->v.expr = expr_addref(c->v.e);
 			cont_decref(c);
 			/* no fun_decref(arg) because it's builtin */
-			return do_toss(next, f);
+			return_toss(next, f);
 		} else {
 			cont *next = make_cont(cont_addref(c->next));
 			expr *e = expr_addref(c->v.e);
 			next->type = APPLY;
 			next->v.f = val; /* no addref because we're about to decref it anyway */
 			cont_decref(c);
-			return do_eval(e, next);
+			return_eval(e, next);
 		}
 	case APPLY:
 	{
 		cont *next = cont_addref(c->next);
 		fun *func = fun_addref(c->v.f);
 		cont_decref(c);
-		return do_apply(func, val, next);
+		return_apply(func, val, next);
 	}
 	case APPLY_DEE:
 	{
 		cont *next = cont_addref(c->next);
 		fun *arg = fun_addref(c->v.f);
 		cont_decref(c);
-		return do_apply(val, arg, next);
+		return_apply(val, arg, next);
 	}
 	case TERM:
-		return do_end(val);
+		return_end(val);
 	default:
-		fprintf(stderr, "Memory corruption at %d\n", __LINE__);
-		return do_end(val);
+		panic("Memory corruption decoding continuation type = %d\n", c->type);
 	}
 }
 
 /* apply "func" to "arg", tossing the result to "c" */
-action apply(fun *func, fun *arg, cont *c) {
+void apply(fun *func, fun *arg, cont *c) {
 	switch (func->type) {
 	case KAY:
 	{
@@ -462,14 +480,14 @@ action apply(fun *func, fun *arg, cont *c) {
 		val->type = KAY1;
 		val->v.onefunc = arg;
 		/* No fun_decref(func) because it's builtin, no fun_decref(arg) because we gave it to val */
-		return do_toss(c, val);
+		return_toss(c, val);
 	}
 	case KAY1:
 	{
 		fun *val = fun_addref(func->v.onefunc);
 		fun_decref(func);
 		fun_decref(arg);
-		return do_toss(c, val);
+		return_toss(c, val);
 	}
 	case ESS:
 	{
@@ -477,7 +495,7 @@ action apply(fun *func, fun *arg, cont *c) {
 		val->type = ESS1;
 		val->v.onefunc = arg;
 		/* No fun_decref(func) because it's builtin, no fun_decref(arg) because we gave it to val */
-		return do_toss(c, val);
+		return_toss(c, val);
 	}
 	case ESS1:
 	{
@@ -487,7 +505,7 @@ action apply(fun *func, fun *arg, cont *c) {
 		val->v.twofunc.f2 = arg;
 		fun_decref(func);
 		/* No fun_decref(arg) because we gave it to val */
-		return do_toss(c, val);
+		return_toss(c, val);
 	}
 	case ESS2:
 	{
@@ -520,12 +538,12 @@ action apply(fun *func, fun *arg, cont *c) {
 
 		fun_decref(func);
 		/* No fun_decref(arg) because we gave it away */
-		return do_eval(e, c);
+		return_eval(e, c);
 	}
 	case DOT:
 		putchar(func->v.ch);
 		fun_decref(func);
-		return do_toss(c, arg);
+		return_toss(c, arg);
 	case DEE:
 	{
 		expr *e = make_expr();
@@ -535,13 +553,13 @@ action apply(fun *func, fun *arg, cont *c) {
 		val->type = DEE1;
 		val->v.expr = e;
 		/* No fun_decref(func) because it's builtin, no fun_decref(arg) because we gave it to e */
-		return do_toss(c, val);
+		return_toss(c, val);
 	}
 	case EYE:
-		return do_toss(c, arg);
+		return_toss(c, arg);
 	case VEE:
 		fun_decref(arg);
-		return do_toss(c, func); /* fun_addref unneeded because it's a builtin */
+		return_toss(c, func);
 	case DEE1:
 	{
 		cont *next = make_cont(c);
@@ -550,7 +568,7 @@ action apply(fun *func, fun *arg, cont *c) {
 		next->v.f = arg;
 		fun_decref(func);
 		/* No fun_decref(arg) nor cont_decref(c) because we gave them to next */
-		return do_eval(e, next);
+		return_eval(e, next);
 	}
 	case SEE:
 	{
@@ -558,101 +576,91 @@ action apply(fun *func, fun *arg, cont *c) {
 		f->type = CONT;
 		f->v.cont = cont_addref(c);
 		/* No fun_decref(func) because it's builtin, no fun_decref(arg) because we're giving it to apply */
-		return do_apply(arg, f, c);
+		return_apply(arg, f, c);
 	}
 	case CONT:
 	{
 		cont *next = cont_addref(func->v.cont);
 		fun_decref(func);
 		cont_decref(c);
-		return do_toss(next, arg);
+		return_toss(next, arg);
 	}
 	case EE:
 		cont_decref(c);
-		return do_end(arg);
+		return_end(arg);
 	case AT:
 		current_character = getchar();
 		if (current_character == EOF) {
-			return do_apply(arg, &v_fun, c);
+			return_apply(arg, &v_fun, c);
 		} else {
-			return do_apply(arg, &i_fun, c);
+			return_apply(arg, &i_fun, c);
 		}
 	case QUESTION:
 	{
 		int ok = func->v.ch == current_character;
 		fun_decref(func);
 		if (ok) {
-			return do_apply(arg, &i_fun, c);
+			return_apply(arg, &i_fun, c);
 		} else {
-			return do_apply(arg, &v_fun, c);
+			return_apply(arg, &v_fun, c);
 		}
 	}
 	case PIPE:
 		if (current_character == EOF) {
-			return do_apply(arg, &v_fun, c);
+			return_apply(arg, &v_fun, c);
 		} else {
 			fun *dot = make_fun();
 			dot->type = DOT;
 			dot->v.ch = current_character;
-			return do_apply(arg, dot, c);
+			return_apply(arg, dot, c);
 		}
 	default:
-		fprintf(stderr, "Memory corruption at %d. Acting like i.\n", __LINE__);
-		return do_toss(c, arg);
+		panic("Memory corruption decoding function type = %d\n", func->type);
 	}
 }
 
 /* evaluate "e", tossing the result to "c" */
-action eval(expr *e, cont *c) {
+void eval(expr *e, cont *c) {
 	if (e->type == FUNCTION) {
 		fun *f = fun_addref(e->v.func);
 		expr_decref(e);
-		return do_toss(c, f);
+		return_toss(c, f);
 	} else { /* e->type == APPLICATION */
 		cont *next = make_cont(c);
 		next->type = EVAL_APPLY;
 		next->v.e = expr_addref(e->v.ap.arg);
 		expr *func = expr_addref(e->v.ap.func);
 		expr_decref(e);
-		return do_eval(func, next);
+		return_eval(func, next);
 	}
 }
 
 int main() {
 	expr *prog = parse();
-	action current_action = eval(prog, &term_c);
+
+	current_action.type = ACT_EVAL;
+	current_action.c = &term_c;
+	current_action.v.ev = prog;
 
 	while (current_action.type != ACT_END) {
 		switch (current_action.type) {
 		case ACT_TOSS:
-			current_action = toss(current_action.c, current_action.v.to);
+			toss(current_action.c, current_action.v.to);
 			break;
 		case ACT_APPLY:
-			current_action = apply(current_action.v.ap.f1, current_action.v.ap.f2, current_action.c);
+			apply(current_action.v.ap.f1, current_action.v.ap.f2, current_action.c);
 			break;
 		case ACT_EVAL:
-			current_action = eval(current_action.v.ev, current_action.c);
+			eval(current_action.v.ev, current_action.c);
 			break;
 		default:
-			fprintf(stderr, "Memory corruption at %d\n", __LINE__);
-			exit(EXIT_FAILURE);
+			panic("Memory corruption decoding action type = %d\n", current_action.type);
 		}
 	}
 
 	printf("\nResult: ");
 	print_fun(current_action.v.to);
 	putchar('\n');
-
-#ifndef NDEBUG
-	fun_decref(current_action.v.to);
-
-	printf("\nSTATS:\n%lu allocations\n%lu frees\n", (unsigned long)n_mallocs, (unsigned long)n_frees);
-	if (n_mallocs > n_frees) {
-		printf("MEMORY LEAK!\n");
-	} else if (n_mallocs < n_frees) {
-		printf("DOUBLE FREE!\n");
-	}
-#endif
-
+	
 	return 0;
 }
